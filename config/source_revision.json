@@ -1,0 +1,4 @@
+{
+  "revision": "current-setup-2026-10-02",
+  "purpose": "Distinct source revision from the old setup snapshot; harmless application behavior is unchanged."
+}
