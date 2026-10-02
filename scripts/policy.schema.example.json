@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "policy_id": "P_current_v1",
+  "github_cli_version": "2.101.0",
+  "oidc_issuer": "https://token.actions.githubusercontent.com",
+  "deny_self_hosted_runners": true,
+  "allowed_tuples": [
+    {
+      "source_repository": "__GITHUB_OWNER__/lambda-release-controls-study",
+      "certificate_identity": "https://github.com/__GITHUB_OWNER__/lambda-release-controls-study/.github/workflows/release.yml@refs/heads/study-current",
+      "signer_digest": "__FROZEN_PRODUCING_WORKFLOW_COMMIT__",
+      "source_digest": "__FROZEN_SOURCE_COMMIT__",
+      "source_ref": "refs/heads/study-current",
+      "predicate_type": "https://slsa.dev/provenance/v1"
+    }
+  ]
+}

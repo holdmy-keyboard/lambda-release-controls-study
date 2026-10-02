@@ -1,0 +1,169 @@
+name: Study alternate fixture producer
+run-name: lrcs-fixture-${{ inputs.attempt_id }}
+
+# Researcher fixture construction only. Exact repository/ref/workflow tuples are
+# checked before OIDC. This workflow can never obtain controller deployment IAM.
+on:
+  workflow_dispatch:
+    inputs:
+      identity_only:
+        description: Record nonsecret OIDC claims for setup; never assume AWS roles
+        required: false
+        default: false
+        type: boolean
+      attempt_id:
+        description: Reserved immutable construction UUID
+        required: true
+        type: string
+      marker:
+        description: Approved 32-character lowercase hex fixture marker
+        required: true
+        type: string
+      fixture_mode:
+        description: Enumerated harmless fixture construction
+        required: true
+        type: choice
+        options: [valid, unsigned, negative_profile, boundary]
+      policy_id:
+        description: Protected construction policy registry key
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lrcs-study-serial
+  cancel-in-progress: false
+
+env:
+  AWS_MAX_ATTEMPTS: "1"
+  AWS_RETRY_MODE: standard
+  AWS_PAGER: ""
+  PYTHONUNBUFFERED: "1"
+  LRCS_BOUND_CONFIG: ${{ vars.LRCS_BOUND_CONFIG }}
+
+jobs:
+  discover:
+    if: inputs.identity_only == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Observe only approved nonsecret claims
+        run: python3 -m scripts.lrcs.discover_identity
+  produce:
+    if: inputs.identity_only != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - name: Start the construction clock
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, time
+          started = time.monotonic_ns()
+          directory = pathlib.Path(os.environ["RUNNER_TEMP"]) / "lrcs"
+          directory.mkdir(mode=0o700, exist_ok=False)
+          with (directory / "clock-start.json").open("x") as output:
+              json.dump({"monotonic_ns": started,
+                         "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                         "clock_owner": "github_job"}, output)
+          PY
+      - name: Check out the authenticated producing commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Validate enumerated fixture identity and bindings
+        id: prepare
+        run: |
+          python3 -m scripts.lrcs.runtime prepare \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json" \
+            --event "$GITHUB_EVENT_PATH" --producer alternate \
+            --clock-start "$RUNNER_TEMP/lrcs/clock-start.json" --output "$GITHUB_OUTPUT"
+      - name: Select the pinned Python patch
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.15"
+          architecture: x64
+          freethreaded: false
+      - name: Verify pinned release tools
+        run: |
+          python -m scripts.lrcs.runtime tools \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Obtain reservation-claim credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.prepare.outputs.build_role_arn }}
+          aws-region: ${{ steps.prepare.outputs.region }}
+          allowed-account-ids: ${{ steps.prepare.outputs.account_id }}
+          role-duration-seconds: 900
+          unset-current-credentials: true
+          disable-retry: true
+          action-timeout-s: 60
+          translate-env-variables: false
+          output-credentials: false
+          mask-aws-account-id: true
+      - name: Claim immutable dispatch UUID once
+        run: |
+          python -m scripts.lrcs.runtime claim \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Build only the harmless local application
+        run: |
+          python -m scripts.lrcs.runtime build \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Obtain fixture construction credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.prepare.outputs.build_role_arn }}
+          aws-region: ${{ steps.prepare.outputs.region }}
+          allowed-account-ids: ${{ steps.prepare.outputs.account_id }}
+          role-duration-seconds: 900
+          unset-current-credentials: true
+          disable-retry: true
+          action-timeout-s: 60
+          translate-env-variables: false
+          output-credentials: false
+          mask-aws-account-id: true
+      - name: Sign under the enumerated fixture profile when required
+        if: steps.prepare.outputs.needs_signing == 'true'
+        run: |
+          python -m scripts.lrcs.runtime sign \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Attest only this workflow's exact final ZIP
+        id: attest
+        timeout-minutes: 2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.prepare.outputs.artifact_path }}
+          show-summary: false
+          push-to-registry: false
+          create-storage-record: false
+      - name: Record unchanged attestation bundle
+        env:
+          ATTESTATION_BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          python -m scripts.lrcs.runtime record-bundle \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json" \
+            --bundle "$ATTESTATION_BUNDLE_PATH"
+      - name: Retain immutable fixture receipt or construction failure
+        if: always()
+        env:
+          LRCS_JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 -m scripts.lrcs.runtime finalize \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"

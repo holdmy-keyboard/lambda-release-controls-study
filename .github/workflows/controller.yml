@@ -1,0 +1,228 @@
+name: Study controller
+run-name: lrcs-${{ inputs.attempt_id }}
+
+# Only the reviewed, protected controller tag is authorized by runtime.prepare
+# and the AWS OIDC trust. Inputs select protected entries, never arbitrary code,
+# roles, targets, repositories, paths, URLs, or policies.
+on:
+  workflow_dispatch:
+    inputs:
+      identity_only:
+        description: Record nonsecret OIDC claims for setup; never assume AWS roles
+        required: false
+        default: false
+        type: boolean
+      attempt_id:
+        description: Reserved immutable attempt UUID
+        required: true
+        type: string
+      workload:
+        description: Approved workload
+        required: true
+        type: choice
+        options: [timing, functional]
+      configuration:
+        description: Treatment
+        required: true
+        type: choice
+        options: [C0, C1, C2, C3]
+      marker:
+        description: Approved 32-character lowercase hex block marker (timing only)
+        required: false
+        type: string
+      fixture_key:
+        description: Protected fixture registry key (functional only)
+        required: false
+        type: string
+      policy_id:
+        description: Protected policy registry key
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lrcs-study-serial
+  cancel-in-progress: false
+
+env:
+  AWS_MAX_ATTEMPTS: "1"
+  AWS_RETRY_MODE: standard
+  AWS_PAGER: ""
+  PYTHONUNBUFFERED: "1"
+  LRCS_BOUND_CONFIG: ${{ vars.LRCS_BOUND_CONFIG }}
+
+jobs:
+  discover:
+    if: inputs.identity_only == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Observe only approved nonsecret claims
+        run: python3 -m scripts.lrcs.discover_identity
+  release:
+    if: inputs.identity_only != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - name: Start the active measurement clock
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, time
+          started = time.monotonic_ns()
+          directory = pathlib.Path(os.environ["RUNNER_TEMP"]) / "lrcs"
+          directory.mkdir(mode=0o700, exist_ok=False)
+          with (directory / "clock-start.json").open("x") as output:
+              json.dump({"monotonic_ns": started,
+                         "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                         "clock_owner": "github_job"}, output)
+          PY
+      - name: Check out the authenticated producing commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Validate frozen identity, dispatch and protected bindings
+        id: prepare
+        run: |
+          python3 -m scripts.lrcs.runtime prepare \
+            --config config/runner_config.json \
+            --state "$RUNNER_TEMP/lrcs/state.json" \
+            --event "$GITHUB_EVENT_PATH" \
+            --clock-start "$RUNNER_TEMP/lrcs/clock-start.json" \
+            --output "$GITHUB_OUTPUT"
+      - name: Select the pinned Python patch
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.15"
+          architecture: x64
+          freethreaded: false
+      - name: Verify pinned release tools
+        run: |
+          python -m scripts.lrcs.runtime tools \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Obtain reservation-claim credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.prepare.outputs.deploy_role_arn }}
+          aws-region: ${{ steps.prepare.outputs.region }}
+          allowed-account-ids: ${{ steps.prepare.outputs.account_id }}
+          role-duration-seconds: 900
+          unset-current-credentials: true
+          disable-retry: true
+          action-timeout-s: 60
+          translate-env-variables: false
+          output-credentials: false
+          mask-aws-account-id: true
+      - name: Claim immutable dispatch UUID once
+        run: |
+          python -m scripts.lrcs.runtime claim \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Build fresh timing input
+        if: steps.prepare.outputs.workload == 'timing'
+        run: |
+          python -m scripts.lrcs.runtime build \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Obtain approved build-sign credentials
+        if: steps.prepare.outputs.workload == 'timing' && steps.prepare.outputs.needs_signing == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.prepare.outputs.build_role_arn }}
+          aws-region: ${{ steps.prepare.outputs.region }}
+          allowed-account-ids: ${{ steps.prepare.outputs.account_id }}
+          role-duration-seconds: 900
+          unset-current-credentials: true
+          disable-retry: true
+          action-timeout-s: 60
+          translate-env-variables: false
+          output-credentials: false
+          mask-aws-account-id: true
+      - name: Sign and resolve exact final ZIP bytes
+        if: steps.prepare.outputs.workload == 'timing' && steps.prepare.outputs.needs_signing == 'true'
+        run: |
+          python -m scripts.lrcs.runtime sign \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Attest this workflow's exact final ZIP
+        id: attest
+        if: steps.prepare.outputs.workload == 'timing' && steps.prepare.outputs.needs_attestation == 'true'
+        timeout-minutes: 2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.prepare.outputs.artifact_path }}
+          show-summary: false
+          push-to-registry: false
+          create-storage-record: false
+      - name: Record unchanged attestation bundle
+        if: steps.prepare.outputs.workload == 'timing' && steps.prepare.outputs.needs_attestation == 'true'
+        env:
+          ATTESTATION_BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          python -m scripts.lrcs.runtime record-bundle \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json" \
+            --bundle "$ATTESTATION_BUNDLE_PATH"
+      - name: Obtain functional fixture read credentials
+        if: steps.prepare.outputs.workload == 'functional'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.prepare.outputs.deploy_role_arn }}
+          aws-region: ${{ steps.prepare.outputs.region }}
+          allowed-account-ids: ${{ steps.prepare.outputs.account_id }}
+          role-duration-seconds: 900
+          unset-current-credentials: true
+          disable-retry: true
+          action-timeout-s: 60
+          translate-env-variables: false
+          output-credentials: false
+          mask-aws-account-id: true
+      - name: Acquire immutable registered fixture versions
+        if: steps.prepare.outputs.workload == 'functional'
+        run: |
+          python -m scripts.lrcs.runtime acquire \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Switch to timing deploy credentials
+        if: steps.prepare.outputs.workload == 'timing'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.prepare.outputs.deploy_role_arn }}
+          aws-region: ${{ steps.prepare.outputs.region }}
+          allowed-account-ids: ${{ steps.prepare.outputs.account_id }}
+          role-duration-seconds: 900
+          unset-current-credentials: true
+          disable-retry: true
+          action-timeout-s: 60
+          translate-env-variables: false
+          output-credentials: false
+          mask-aws-account-id: true
+      - name: Enforce the treatment's provenance decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m scripts.lrcs.runtime gate \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Deploy guarded exact version and publish readiness receipt
+        run: |
+          python -m scripts.lrcs.runtime deploy \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Retain terminal decision and diagnostics
+        if: always()
+        env:
+          LRCS_JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 -m scripts.lrcs.runtime finalize \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"

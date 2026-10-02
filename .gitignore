@@ -1,0 +1,13 @@
+# Research evidence and cloud state stay private.
+.private-evidence/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+*.auto.tfvars
+*.auto.tfvars.json
+infrastructure/bindings.local.json
+__pycache__/
+.DS_Store
