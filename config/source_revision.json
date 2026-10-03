@@ -1,1 +1,1 @@
-{"revision": "current-setup-2026-10-03", "purpose": "Distinct current source revision; application remains identical to corrected old source."}
+{"revision": "old-setup-2026-10-04", "purpose": "Pre-experiment correction: role ARN, bounded signing, timeout evidence and observer identity."}

@@ -74,6 +74,12 @@ class Controller:
             return arn
         if principal(observer.get('Arn'))==principal(reset.get('Arn')):
             raise StageError('Observer and reset must use distinct IAM principals')
+        expected_observer=f'arn:aws:sts::{self.c["account_id"]}:assumed-role/lrcs-20260928-observer'
+        expected_reset=self.c.get('reset_principal_arn')
+        if principal(observer.get('Arn'))!=expected_observer:
+            raise StageError('Observer must use the exact scoped study observer role')
+        if not expected_reset or reset.get('Arn')!=expected_reset:
+            raise StageError('Reset operator differs from the verified bound principal')
         return {'observer':observer,'reset':reset}
     def reset(self,arm):
         name='lrcs-20260928-'+arm.lower()

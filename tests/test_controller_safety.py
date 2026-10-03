@@ -14,6 +14,16 @@ class ControllerSafetyTests(unittest.TestCase):
     def test_aliases_for_same_principal_rejected(self):
         self.c.aws=lambda *a,**kw:{'Account':'unit-account','Arn':'arn:aws:sts::unit:assumed-role/role/session-'+kw.get('profile','observer')}
         with self.assertRaises(StageError):self.c.validate_sessions()
+    def test_exact_observer_and_operator_required(self):
+        self.c.c['reset_principal_arn']='arn:aws:iam::unit-account:user/operator'
+        observer={'Account':'unit-account','Arn':'arn:aws:sts::unit-account:assumed-role/lrcs-20260928-observer/session'}
+        reset={'Account':'unit-account','Arn':self.c.c['reset_principal_arn']}
+        self.c.aws=Mock(side_effect=[observer,reset])
+        self.assertEqual(self.c.validate_sessions(),{'observer':observer,'reset':reset})
+        self.c.aws=Mock(side_effect=[dict(observer,Arn=observer['Arn'].replace('lrcs-20260928-observer','Administrator')),reset])
+        with self.assertRaises(StageError):self.c.validate_sessions()
+        self.c.aws=Mock(side_effect=[observer,dict(reset,Arn=reset['Arn']+'-other')])
+        with self.assertRaises(StageError):self.c.validate_sessions()
     def test_ambient_credentials_not_carried_into_observer(self):
         self.c.command=Mock(return_value={})
         with patch.dict(os.environ,{'AWS_ACCESS_KEY_ID':'SYNTHETIC','AWS_SECRET_ACCESS_KEY':'SYNTHETIC','AWS_SESSION_TOKEN':'SYNTHETIC'}):self.c.aws('sts','get-caller-identity',[])

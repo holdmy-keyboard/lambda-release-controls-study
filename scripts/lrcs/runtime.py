@@ -20,7 +20,7 @@ import uuid
 import zipfile
 
 from scripts.build_package import build_package
-from scripts.lrcs.gate import verify_artifact, validate_policy, _hash_file
+from scripts.lrcs.gate import verify_artifact, validate_policy, _hash_file, _raw
 from scripts.lrcs.deployment import validate_target, validate_csc, ready, classify_update_error
 
 MAX_BYTES=1048576
@@ -60,7 +60,7 @@ def load_config(path):
     for kind in ('artifacts','signed'):
         if config['buckets'][kind]!=f'{prefix}{account}-eu-central-1-{kind}':raise StageError('Wrong bucket binding')
     for key,name in {'build':'build-sign','fixtures':'fixture-sign','deploy':'deploy'}.items():
-        if config['roles'][key]!=f'arn:aws:iam::{account}:role:{prefix}{name}':raise StageError('Wrong role binding')
+        if config['roles'][key]!=f'arn:aws:iam::{account}:role/{prefix}{name}':raise StageError('Wrong role binding')
     for policy in config['policies'].values():validate_policy(policy)
     return config
 
@@ -142,35 +142,61 @@ class Runtime:
         active=(time.monotonic_ns()-self.s['clock']['monotonic_ns'])/1e9
         if active>=600:raise StageError('Active deadline exceeded',reason='timeout')
         return min(limit,600-active)
-    def aws(self,service,operation,arguments,limit=30):
+    def aws(self,service,operation,arguments,limit=30,*,deadline=None):
         argv=['aws',service,operation,*arguments,'--region',self.c['region'],'--output','json','--no-cli-pager']
         env=dict(os.environ);env.update(AWS_MAX_ATTEMPTS='1',AWS_RETRY_MODE='standard',AWS_PAGER='')
-        started=time.monotonic_ns()
-        try:p=subprocess.run(argv,capture_output=True,text=True,env=env,timeout=self.remaining(limit))
-        except subprocess.TimeoutExpired as error:raise StageError('AWS call timed out',reason='timeout') from error
-        record={'service':service,'operation':operation,'started_monotonic_ns':started,'ended_monotonic_ns':time.monotonic_ns(),
-                'exit_code':p.returncode,'stdout':p.stdout,'stderr':p.stderr,'request_id':None,
+        timeout=self.remaining(limit)
+        if deadline is not None:
+            timeout=min(timeout,deadline-time.monotonic())
+            if timeout<=0:raise StageError('AWS stage deadline exhausted before request',reason='timeout')
+        record={'service':service,'operation':operation,'argv':argv,'started_monotonic_ns':time.monotonic_ns(),
+                'timeout_seconds':timeout,'exit_code':None,'timed_out':False,'request_id':None,
                 'request_id_missing_reason':'AWS CLI normal JSON output does not expose response metadata'}
-        dump(self.d/f'aws-{len(self.s["stage_events"]):04d}.json',record,True)
-        self.s['stage_events'].append({'operation':service+'.'+operation,'exit_code':p.returncode,'evidence':f'aws-{len(self.s["stage_events"]):04d}.json'})
-        self.save()
-        if p.returncode:
-            match=re.search(r'An error occurred \(([^)]+)\)',p.stderr);code=match.group(1) if match else 'unknown'
+        stdout=stderr=b''
+        try:
+            # Bytes preserve exact partial output even when TimeoutExpired does
+            # not decode its capture (and when output is not valid UTF-8).
+            process=subprocess.run(argv,capture_output=True,env=env,timeout=timeout)
+            stdout,stderr=process.stdout,process.stderr
+            record['exit_code']=process.returncode
+            if deadline is not None and time.monotonic()>=deadline:
+                record['timed_out']=True
+                record['deadline_exceeded_after_response']=True
+                raise StageError('AWS stage deadline exceeded during request',reason='timeout')
+        except subprocess.TimeoutExpired as error:
+            stdout,stderr=error.stdout,error.stderr
+            record['timed_out']=True
+            raise StageError('AWS call timed out',reason='timeout') from error
+        except OSError as error:
+            record['launch_error']=str(error)
+            raise
+        finally:
+            out,err=_raw(stdout),_raw(stderr)
+            record.update(ended_monotonic_ns=time.monotonic_ns(),stdout=out['utf8'],stderr=err['utf8'],
+                          stdout_base64=out['base64'],stderr_base64=err['base64'],
+                          stdout_sha256=out['sha256'],stderr_sha256=err['sha256'])
+            name=f'aws-{len(self.s["stage_events"]):04d}.json'
+            dump(self.d/name,record,True)
+            self.s['stage_events'].append({'operation':service+'.'+operation,'exit_code':record['exit_code'],
+                                          'timed_out':record['timed_out'],'evidence':name})
+            self.save()
+        if process.returncode:
+            match=re.search(r'An error occurred \(([^)]+)\)',record['stderr']);code=match.group(1) if match else 'unknown'
             outcome,reason=classify_update_error(code) if (service,operation)==('lambda','update-function-code') else ('operational_error','service_or_transport_failure')
             raise StageError(code,outcome=outcome,reason=reason)
-        return json.loads(p.stdout or '{}')
-    def put(self,path,bucket,key):
+        return json.loads(record['stdout'] or '{}')
+    def put(self,path,bucket,key,*,deadline=None):
         path=Path(path)
         if path.is_symlink() or not path.is_file() or path.stat().st_size>MAX_BYTES:raise StageError('Invalid or oversized evidence object')
         digest=_hash_file(path)
-        response=self.aws('s3api','put-object',['--bucket',bucket,'--key',key,'--body',str(path),'--if-none-match','*'])
+        response=self.aws('s3api','put-object',['--bucket',bucket,'--key',key,'--body',str(path),'--if-none-match','*'],deadline=deadline)
         version=response.get('VersionId')
         if not version or version=='null':raise StageError('S3 versioning not effective')
         if _hash_file(path)!=digest:raise StageError('Local upload bytes changed')
         return {'bucket':bucket,'key':key,'version':version,'sha256':digest,'size_bytes':path.stat().st_size}
-    def get(self,reference,path,limit=30):
+    def get(self,reference,path,limit=30,*,deadline=None):
         if reference.get('bucket') not in self.c['buckets'].values() or not reference.get('version') or reference['version']=='null':raise StageError('Unbound object version')
-        response=self.aws('s3api','get-object',['--bucket',reference['bucket'],'--key',reference['key'],'--version-id',reference['version'],str(path)],limit)
+        response=self.aws('s3api','get-object',['--bucket',reference['bucket'],'--key',reference['key'],'--version-id',reference['version'],str(path)],limit,deadline=deadline)
         if response.get('VersionId')!=reference['version'] or Path(path).stat().st_size>MAX_BYTES:raise StageError('Fetched version/size mismatch')
         digest=_hash_file(Path(path))
         if reference.get('sha256') and reference['sha256']!=digest:raise StageError('Transport differs from immutable fixture manifest')
@@ -206,31 +232,41 @@ class Runtime:
         self.s['final_sha256']=_hash_file(self.artifact)
     def sign(self):
         if not self.s['needs_signing'] or 'build' not in self.s:raise StageError('Signing not authorized for this path')
-        started=time.monotonic();prefix='fixtures' if self.s['workload']=='producer' else 'timing'
+        started=time.monotonic();deadline=started+180
+        prefix='fixtures' if self.s['workload']=='producer' else 'timing'
+        def remaining():
+            budget=deadline-time.monotonic()
+            if budget<=0:raise StageError('Signing deadline exceeded',reason='timeout')
+            return budget
         profile_key='negative' if self.s['inputs'].get('fixture_mode')=='negative_profile' else 'allowed'
         profile=self.c['profiles'][profile_key]
-        current=self.aws('signer','get-signing-profile',['--profile-name',profile['name']])
+        current=self.aws('signer','get-signing-profile',['--profile-name',profile['name']],deadline=deadline)
         if current.get('profileVersion')!=profile['version'] or current.get('status')!='Active':raise StageError('Signing profile drift')
-        source=self.put(self.artifact,self.c['buckets']['artifacts'],f'source/{prefix}/{self.s["attempt_id"]}/unsigned.zip')
+        source=self.put(self.artifact,self.c['buckets']['artifacts'],f'source/{prefix}/{self.s["attempt_id"]}/unsigned.zip',deadline=deadline)
         result=self.aws('signer','start-signing-job',['--source',json.dumps({'s3':{'bucketName':source['bucket'],'key':source['key'],'version':source['version']}}),
             '--destination',json.dumps({'s3':{'bucketName':self.c['buckets']['signed'],'prefix':f'signed/{prefix}/{self.s["attempt_id"]}/'}}),
-            '--profile-name',profile['name'],'--client-request-token',self.s['attempt_id']])
-        self.s['signing']={'job_id':result['jobId'],'source':source,'profile':profile};self.save()
-        while time.monotonic()-started<180:
-            job=self.aws('signer','describe-signing-job',['--job-id',result['jobId']],min(30,180-(time.monotonic()-started)))
+            '--profile-name',profile['name'],'--client-request-token',self.s['attempt_id']],deadline=deadline)
+        self.s['signing']={'job_id':result['jobId'],'source':source,'profile':profile,
+                           'started_monotonic_seconds':started,'deadline_monotonic_seconds':deadline};self.save()
+        while True:
+            remaining()
+            job=self.aws('signer','describe-signing-job',['--job-id',result['jobId']],deadline=deadline)
             if job.get('status')=='Failed':raise StageError('Signing job failed',reason='service_or_transport_failure')
             if job.get('status')=='Succeeded':break
-            time.sleep(2)
-        else:raise StageError('Signing deadline exceeded',reason='timeout')
+            time.sleep(min(2,remaining()))
         if job.get('profileVersion')!=profile['version'] or job.get('profileName')!=profile['name'] or job.get('source',{}).get('s3')!={'bucketName':source['bucket'],'key':source['key'],'version':source['version']}:
             raise StageError('Signing lineage mismatch')
         obj=job['signedObject']['s3']
         if obj['bucketName']!=self.c['buckets']['signed'] or not obj['key'].startswith(f'signed/{prefix}/{self.s["attempt_id"]}/'):raise StageError('Unexpected signing output')
-        head=self.aws('s3api','head-object',['--bucket',obj['bucketName'],'--key',obj['key']])
+        head=self.aws('s3api','head-object',['--bucket',obj['bucketName'],'--key',obj['key']],deadline=deadline)
         reference={'bucket':obj['bucketName'],'key':obj['key'],'version':head.get('VersionId')}
-        signed=self.d/'signed.zip';digest=self.get(reference,signed)
+        remaining()
+        signed=self.d/'signed.zip';digest=self.get(reference,signed,deadline=deadline)
+        remaining()
         signed.replace(self.artifact);reference['sha256']=digest
-        self.s['final_sha256']=digest;self.s['signing'].update(output=reference,job=job,elapsed_seconds=time.monotonic()-started)
+        finished=time.monotonic()
+        if finished>=deadline:raise StageError('Signing deadline exceeded',reason='timeout')
+        self.s['final_sha256']=digest;self.s['signing'].update(output=reference,job=job,elapsed_seconds=finished-started)
     def record_bundle(self,path):
         if not self.s['needs_attestation'] or _hash_file(self.artifact)!=self.s.get('final_sha256'):raise StageError('Attestation stage/bytes mismatch')
         path=Path(path)
