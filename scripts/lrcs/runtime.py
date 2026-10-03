@@ -120,7 +120,25 @@ class Runtime:
             raise StageError('Protected config changed during the attempt')
         self.artifact=self.d/'final.zip'
     def save(self):dump(self.path,self.s)
+    def start_stage(self,name):
+        if any(event['name']==name and event.get('ended_monotonic_ns') is None for event in self.s.get('stage_envelopes',[])):
+            raise StageError('Stage clock is already open: '+name)
+        event={'name':name,'clock_owner':'github_job','started_monotonic_ns':time.monotonic_ns(),
+               'started_utc':utc(),'ended_monotonic_ns':None,'duration_seconds':None,'status':'running'}
+        self.s.setdefault('stage_envelopes',[]).append(event);self.save()
+    def end_stage(self,name,status='success',ended=None):
+        matches=[event for event in self.s.get('stage_envelopes',[]) if event['name']==name and event.get('ended_monotonic_ns') is None]
+        if len(matches)!=1:raise StageError('No unique open stage clock: '+name)
+        event=matches[0];ended=ended if ended is not None else time.monotonic_ns()
+        if ended<event['started_monotonic_ns']:raise StageError('Stage clock moved backwards')
+        event.update(ended_monotonic_ns=ended,ended_utc=utc(),duration_seconds=(ended-event['started_monotonic_ns'])/1e9,status=status)
+        self.save()
     def remaining(self,limit):
+        if self.s.get('active_end_monotonic_ns') is not None or self.s.get('finalization_started_monotonic_ns') is not None:
+            anchor=self.s.get('active_end_monotonic_ns',self.s.get('finalization_started_monotonic_ns'))
+            cleanup=(time.monotonic_ns()-anchor)/1e9
+            if cleanup>=120:raise StageError('Post-attempt reconciliation deadline exceeded',reason='timeout')
+            return min(limit,120-cleanup)
         active=(time.monotonic_ns()-self.s['clock']['monotonic_ns'])/1e9
         if active>=600:raise StageError('Active deadline exceeded',reason='timeout')
         return min(limit,600-active)
@@ -224,6 +242,12 @@ class Runtime:
         if self.s['workload']!='functional':raise StageError('Not a functional path')
         fixture=self.c['fixtures'][self.s['inputs']['fixture_key']]
         self.s['final_sha256']=self.get(fixture['artifact'],self.artifact)
+        # The no-provenance arms consume the same candidate bytes but never
+        # invoke the evidence resolver, including its S13 injected outage.
+        if self.s['configuration'] in ('C0','C2'):
+            self.s.update(acquisition_status='not_applicable',acquisition_elapsed_seconds=None,
+                          fixture_key=self.s['inputs']['fixture_key'])
+            return
         started=time.monotonic();status=fixture['evidence_status']
         if status=='absent':
             if fixture.get('bundle') is not None:raise StageError('Contradictory absence fixture')
@@ -276,18 +300,52 @@ class Runtime:
         raise StageError('Readiness deadline exceeded',reason='timeout')
     def publish_receipt(self):
         if self.s.get('receipt_reference'):return
-        # Keep raw evidence private; publisher role can write only its receipt
-        # prefix. A terminal receipt is always an immutable named version.
+        # Publish the compact readiness/decision receipt first. Diagnostics and
+        # smoke checks occur after the active endpoint and receipt publication;
+        # their treatment-dependent sizes must not enter the observed endpoint.
+        prefix='fixtures' if self.s['workload']=='producer' else 'controller'
+        receipt=self.d/'receipt.json'
+        fields=('schema_version','attempt_id','phase','workload','configuration','run_id','identity',
+                'config_sha256','outcome','reason','validity','deployment_attempted','final_sha256',
+                'pre_target','accepted_update','post_target','active_end_monotonic_ns','active_end_utc',
+                'active_seconds','inputs','artifact_reference','bundle_reference')
+        compact={key:self.s[key] for key in fields if key in self.s}
+        compact['postrun_key']=f'receipts/{prefix}/{self.s["attempt_id"]}/postrun.json'
+        dump(receipt,compact,True)
+        self.s['receipt_reference']=self.put(receipt,self.c['buckets']['artifacts'],f'receipts/{prefix}/{self.s["attempt_id"]}/receipt.json')
+        self.save()
+    def publish_diagnostics(self):
+        if self.s.get('diagnostics_reference'):return
         prefix='fixtures' if self.s['workload']=='producer' else 'controller'
         archive=self.d/'diagnostics.zip'
         with zipfile.ZipFile(archive,'x',compression=zipfile.ZIP_DEFLATED) as z:
             for path in sorted(self.d.glob('*.json')):
-                if path.name not in ('receipt.json',) and not path.is_symlink():
+                if path.name not in ('postrun.json',) and not path.is_symlink():
                     z.write(path,path.name)
         self.s['diagnostics_reference']=self.put(archive,self.c['buckets']['artifacts'],f'receipts/{prefix}/{self.s["attempt_id"]}/diagnostics.zip')
-        receipt=self.d/'receipt.json';dump(receipt,self.s,True)
-        self.s['receipt_reference']=self.put(receipt,self.c['buckets']['artifacts'],f'receipts/{prefix}/{self.s["attempt_id"]}/receipt.json')
+    def smoke(self):
+        """Synchronous, bounded correctness check strictly after the receipt."""
+        if self.s.get('outcome') not in ('allow','allow_with_warning'):return
+        if not self.s.get('receipt_reference'):raise StageError('Smoke cannot precede readiness receipt')
+        arm=self.s['configuration'];output=self.d/'smoke-response.json'
+        marker=self.s['inputs'].get('marker')
+        if self.s['workload']=='functional':
+            marker=self.c['fixtures'][self.s['inputs']['fixture_key']].get('marker')
+        if not re.fullmatch('[0-9a-f]{32}',marker or ''):raise StageError('Missing independently bound smoke marker')
+        response=self.aws('lambda','invoke',['--function-name','lrcs-20260928-'+arm.lower(),
+            '--invocation-type','RequestResponse','--cli-binary-format','raw-in-base64-out','--payload','{}',str(output)],limit=15)
+        payload=json.loads(output.read_text())
+        if response.get('FunctionError') or response.get('StatusCode')!=200 or payload!={'release_marker':marker}:
+            self.s['smoke']={'status':'mismatch','reason':'handler_response_mismatch','response':response,'payload':payload}
+            self.s['validity']='measurement_invalid';self.save()
+            return
+        self.s['smoke']={'status':'match','response':response,'release_marker':marker}
     def finalize(self):
+        self.s.setdefault('finalization_started_monotonic_ns',time.monotonic_ns())
+        # An interrupted action may not reach its explicit end step. Retain an
+        # incomplete stage, never invent a measured end or a zero duration.
+        for event in self.s.get('stage_envelopes',[]):
+            if event.get('ended_monotonic_ns') is None:event['status']='interrupted_end_not_observed'
         if self.s['workload']=='producer' and self.s.get('bundle_sha256') and os.environ.get('LRCS_JOB_STATUS')=='success':
             if _hash_file(self.artifact)!=self.s['final_sha256']:raise StageError('Producer bytes changed')
             self.s['artifact_reference']=self.put(self.artifact,self.c['buckets']['artifacts'],f'source/fixtures/{self.s["attempt_id"]}/final.zip')
@@ -295,15 +353,28 @@ class Runtime:
             self.s.update(outcome='constructed',reason='fixture_not_yet_independently_validated',validity='unresolved')
         if self.s['outcome'] is None:self.s.update(outcome='operational_error',reason='upstream_job_failed_or_incomplete')
         self.publish_receipt()
+        if self.s['workload']!='producer':
+            try:self.smoke()
+            except (StageError,OSError,ValueError,KeyError,subprocess.SubprocessError) as error:
+                self.s.update(smoke={'status':'error','reason':str(error)},validity='unresolved')
+        self.save();self.publish_diagnostics()
+        prefix='fixtures' if self.s['workload']=='producer' else 'controller'
+        postrun={'attempt_id':self.s['attempt_id'],'run_id':self.s['run_id'],'configuration':self.s['configuration'],
+                 'readiness_receipt_reference':self.s.get('receipt_reference'),'diagnostics_reference':self.s.get('diagnostics_reference'),
+                 'outcome':self.s['outcome'],'validity':self.s['validity'],'smoke_result':self.s.get('smoke'),
+                 'job_status_at_finalize':os.environ.get('LRCS_JOB_STATUS'),'stage_envelopes':self.s.get('stage_envelopes',[])}
+        path=self.d/'postrun.json';dump(path,postrun,True)
+        self.s['postrun_reference']=self.put(path,self.c['buckets']['artifacts'],f'receipts/{prefix}/{self.s["attempt_id"]}/postrun.json')
 
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=['prepare','tools','claim','build','sign','record-bundle','acquire','gate','deploy','finalize'])
+    parser.add_argument('command',choices=['prepare','tools','claim','build','sign','record-bundle','acquire','gate','deploy','finalize','stage-start','stage-end'])
     parser.add_argument('--config',type=Path,required=True);parser.add_argument('--state',type=Path,required=True)
     parser.add_argument('--event',type=Path);parser.add_argument('--clock-start',type=Path);parser.add_argument('--output',type=Path)
     parser.add_argument('--producer',choices=['release','alternate']);parser.add_argument('--bundle',type=Path)
-    args=parser.parse_args(argv);runtime=None
+    parser.add_argument('--stage',choices=['attestation']);parser.add_argument('--status',choices=['success','failure','cancelled','skipped'],default='success')
+    args=parser.parse_args(argv);runtime=None;instrumented=False
     try:
         config=load_config(args.config)
         if args.command=='prepare':
@@ -320,12 +391,26 @@ def main(argv=None):
                     output.write(k+'='+v+'\n')
             return 0
         runtime=Runtime(config,args.state)
-        if args.command=='record-bundle':runtime.record_bundle(args.bundle)
-        else:getattr(runtime,args.command)()
+        if args.command in ('stage-start','stage-end'):
+            if args.stage is None:raise StageError('An explicit external stage is required')
+            if args.command=='stage-start':runtime.start_stage(args.stage)
+            else:runtime.end_stage(args.stage,args.status)
+        else:
+            # Finalize lies outside both measured intervals and may contain
+            # diagnostics publication; it is not an active release stage.
+            instrumented=args.command!='finalize'
+            if instrumented:runtime.start_stage(args.command)
+            if args.command=='record-bundle':runtime.record_bundle(args.bundle)
+            else:getattr(runtime,args.command)()
+            if instrumented:
+                end=runtime.s.get('active_end_monotonic_ns') if args.command=='deploy' else None
+                runtime.end_stage(args.command,ended=end);instrumented=False
         runtime.save();return 0
     except (StageError,OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError) as error:
         outcome=getattr(error,'outcome','operational_error');reason=getattr(error,'reason','unexpected_configuration')
         if runtime:
+            if instrumented:
+                runtime.end_stage(args.command,'failure');instrumented=False
             if runtime.s['outcome'] in (None,'constructed'):
                 runtime.s.update(outcome=outcome,reason=reason,validity='unresolved')
             runtime.s.setdefault('stage_failures',[]).append({'stage':args.command,'detail':str(error),'utc':utc()})

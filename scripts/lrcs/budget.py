@@ -18,7 +18,7 @@ CAPS = {'prototype_paths':60, 'pilot_paths':180, 'lambda_mutations':2000,
 # worst supported path even where a particular treatment uses less.
 PATH_RESERVATION = {'lambda_mutations':2,'signing_jobs':1,'s3_versions':10,
                     's3_tier1':16,'s3_tier2':500,'invocations':1,
-                    'runner_minutes':10,'egress_bytes':8_000_000}
+                    'runner_minutes':12,'egress_bytes':8_000_000}
 
 class BudgetStop(ValueError):
     pass

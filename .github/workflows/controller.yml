@@ -71,7 +71,7 @@ jobs:
   release:
     if: inputs.identity_only != true
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 12
     permissions:
       contents: read
       id-token: write
@@ -158,6 +158,12 @@ jobs:
         run: |
           python -m scripts.lrcs.runtime sign \
             --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Start the attestation generation clock
+        id: attestation_clock
+        if: steps.prepare.outputs.workload == 'timing' && steps.prepare.outputs.needs_attestation == 'true'
+        run: |
+          python -m scripts.lrcs.runtime stage-start --stage attestation \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
       - name: Attest this workflow's exact final ZIP
         id: attest
         if: steps.prepare.outputs.workload == 'timing' && steps.prepare.outputs.needs_attestation == 'true'
@@ -168,6 +174,14 @@ jobs:
           show-summary: false
           push-to-registry: false
           create-storage-record: false
+      - name: Close the attestation clock even when generation failed
+        if: always() && steps.attestation_clock.outcome == 'success'
+        env:
+          ATTESTATION_STEP_STATUS: ${{ steps.attest.outcome }}
+        run: |
+          python -m scripts.lrcs.runtime stage-end --stage attestation \
+            --status "$ATTESTATION_STEP_STATUS" \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
       - name: Record unchanged attestation bundle
         if: steps.prepare.outputs.workload == 'timing' && steps.prepare.outputs.needs_attestation == 'true'
         env:
@@ -219,6 +233,20 @@ jobs:
         run: |
           python -m scripts.lrcs.runtime deploy \
             --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Restore receipt publication credentials after a failed stage
+        if: always() && steps.prepare.outcome == 'success' && job.status != 'success'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.prepare.outputs.deploy_role_arn }}
+          aws-region: ${{ steps.prepare.outputs.region }}
+          allowed-account-ids: ${{ steps.prepare.outputs.account_id }}
+          role-duration-seconds: 900
+          unset-current-credentials: true
+          disable-retry: true
+          action-timeout-s: 60
+          translate-env-variables: false
+          output-credentials: false
+          mask-aws-account-id: true
       - name: Retain terminal decision and diagnostics
         if: always()
         env:

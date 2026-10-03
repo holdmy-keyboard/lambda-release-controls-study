@@ -61,7 +61,7 @@ jobs:
   produce:
     if: inputs.identity_only != true
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 12
     permissions:
       contents: read
       id-token: write
@@ -144,6 +144,11 @@ jobs:
         run: |
           python -m scripts.lrcs.runtime sign \
             --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
+      - name: Start the attestation generation clock
+        id: attestation_clock
+        run: |
+          python -m scripts.lrcs.runtime stage-start --stage attestation \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
       - name: Attest only this workflow's exact final ZIP
         id: attest
         timeout-minutes: 2
@@ -153,6 +158,14 @@ jobs:
           show-summary: false
           push-to-registry: false
           create-storage-record: false
+      - name: Close the attestation clock even when generation failed
+        if: always() && steps.attestation_clock.outcome == 'success'
+        env:
+          ATTESTATION_STEP_STATUS: ${{ steps.attest.outcome }}
+        run: |
+          python -m scripts.lrcs.runtime stage-end --stage attestation \
+            --status "$ATTESTATION_STEP_STATUS" \
+            --config config/runner_config.json --state "$RUNNER_TEMP/lrcs/state.json"
       - name: Record unchanged attestation bundle
         env:
           ATTESTATION_BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}

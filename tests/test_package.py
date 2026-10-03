@@ -46,8 +46,26 @@ class PackageTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("study_lambda", destination / "lambda_function.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.assertEqual(module.lambda_handler({"command": "ignored", "marker": "ignored"}, None),
+        self.assertEqual(module.handler({"command": "ignored", "marker": "ignored"}, None),
                          {"release_marker": MARKER})
+
+    def test_cloud_handler_configuration_matches_packaged_callable(self):
+        import re
+        from scripts.lrcs.deployment import validate_target
+        terraform = (ROOT / "infrastructure/terraform/targets/main.tf").read_text()
+        configured = re.search(r'handler\s*=\s*"([^"]+)"', terraform).group(1)
+        self.assertEqual(configured, "lambda_function.handler")
+        deployment_source = (ROOT / "scripts/lrcs/deployment.py").read_text()
+        self.assertIn("'Handler':'" + configured + "'", deployment_source)
+        output, _ = self.build()
+        destination = self.directory / "cloud-handler"
+        with zipfile.ZipFile(output) as archive:
+            archive.extractall(destination)
+        module_name, function_name = configured.split(".")
+        spec = importlib.util.spec_from_file_location(module_name, destination / (module_name + ".py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(getattr(module, function_name)({}, None), {"release_marker": MARKER})
 
     def test_boundary_has_inert_constant_and_preserves_handler(self):
         plain, _ = self.build("plain.zip")
