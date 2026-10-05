@@ -26,7 +26,11 @@ class Controller:
     def __init__(self,config,profile,directory,gh,token_file,reset_profile):
         if not profile or not reset_profile or profile==reset_profile:
             raise StageError('Distinct observer and reset AWS profiles are required')
-        self.c=config;self.profile=profile;self.reset_profile=reset_profile
+        # Operator identity is a local authentication binding, never runner
+        # routing metadata. Keep it out of the repository-variable payload.
+        self.reset_principal_arn=config.get('reset_principal_arn')
+        self.c={key:value for key,value in config.items() if key!='reset_principal_arn'}
+        self.profile=profile;self.reset_profile=reset_profile
         self.d=Path(directory);self.d.mkdir(mode=0o700,parents=True,exist_ok=False)
         self.gh=str(gh);self.token_file=Path(token_file);self.event=0;self.deadline=None
     def command(self,argv,env=None,timeout=30,stdin=None,allowed=(0,)):
@@ -75,7 +79,7 @@ class Controller:
         if principal(observer.get('Arn'))==principal(reset.get('Arn')):
             raise StageError('Observer and reset must use distinct IAM principals')
         expected_observer=f'arn:aws:sts::{self.c["account_id"]}:assumed-role/lrcs-20260928-observer'
-        expected_reset=self.c.get('reset_principal_arn')
+        expected_reset=self.reset_principal_arn
         if principal(observer.get('Arn'))!=expected_observer:
             raise StageError('Observer must use the exact scoped study observer role')
         if not expected_reset or reset.get('Arn')!=expected_reset:
