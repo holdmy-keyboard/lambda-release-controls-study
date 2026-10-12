@@ -6,7 +6,7 @@ from scripts.lrcs.deployment import hash_base64
 class ControllerTests(unittest.TestCase):
     def setUp(self):
         self.expected={'attempt_id':'synthetic','configuration':'C3','run_id':'123'}
-        self.receipt=self.expected|{'outcome':'allow','deployment_attempted':True,'accepted_update':{'RevisionId':'fresh'},'pre_target':{'RevisionId':'old'},'final_sha256':'ab'*32}
+        self.receipt=self.expected|{'outcome':'allow','deployment_attempted':True,'accepted_update':{'RevisionId':'fresh'},'pre_target':{'RevisionId':'old'},'post_target':{'RevisionId':'fresh'},'final_sha256':'ab'*32}
         self.snapshot={'RevisionId':'fresh','State':'Active','LastUpdateStatus':'Successful','CodeSha256':hash_base64('ab'*32)}
     def test_independent_ready(self):self.assertTrue(collect_ready(self.receipt,self.snapshot,self.expected))
     def test_cross_run_receipt(self):
@@ -16,6 +16,12 @@ class ControllerTests(unittest.TestCase):
         self.snapshot['RevisionId']='old';self.assertFalse(collect_ready(self.receipt,self.snapshot,self.expected))
     def test_allow_requires_api_acceptance(self):
         del self.receipt['accepted_update']
+        with self.assertRaises(ValueError):collect_ready(self.receipt,self.snapshot,self.expected)
+    def test_runner_completion_revision_must_match_observer(self):
+        self.receipt['post_target']['RevisionId']='other'
+        with self.assertRaises(ValueError):collect_ready(self.receipt,self.snapshot,self.expected)
+    def test_runner_completion_receipt_required(self):
+        del self.receipt['post_target']
         with self.assertRaises(ValueError):collect_ready(self.receipt,self.snapshot,self.expected)
     def test_pending_is_not_an_outcome(self):
         self.receipt['outcome']=None;self.assertFalse(collect_ready(self.receipt,{},self.expected))

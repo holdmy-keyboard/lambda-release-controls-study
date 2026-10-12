@@ -46,5 +46,14 @@ class ControllerSafetyTests(unittest.TestCase):
         self.c.deadline=time.monotonic()-1
         with patch('scripts.lrcs.controller.subprocess.run',side_effect=AssertionError('must not start')):
             with self.assertRaises(StageError):self.c.command(['unit'])
+    def test_reset_failure_holds_before_dispatch(self):
+        repo='holdmy-keyboard/lambda-release-controls-study';commit='a'*40
+        self.c.c.update(study_repository=repo,identities=[{'role':'controller','repository':repo,'ref':'refs/tags/lrcs-controller-v1','commit':commit}],policies={'unit':{}})
+        self.c.gh_api=Mock(return_value={'object':{'type':'commit','sha':commit}})
+        self.c.validate_sessions=Mock(return_value={});self.c.reset=Mock(side_effect=ValueError('unsettled reset'));ledger=Mock()
+        with self.assertRaises(ValueError):self.c.run({'configuration':'C0','attempt_id':'unit','workload':'timing','policy_id':'unit'},'prototype',ledger)
+        self.assertTrue((self.root/'reconciliation-required.json').exists())
+        self.assertFalse(json.loads((self.c.d/'pre-dispatch-reset-failure.json').read_text())['workflow_dispatched'])
+        self.assertEqual(self.c.gh_api.call_count,1);ledger.reserve.assert_called_once()
 
 if __name__=='__main__':unittest.main()

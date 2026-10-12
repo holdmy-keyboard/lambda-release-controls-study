@@ -40,14 +40,23 @@ def validate_csc(arm,attached,definition,expected_arn,allowed_profile_version):
 
 
 def ready(snapshot,accepted,previous_revision,expected_digest):
-    """Require the accepted candidate's fresh revision and exact copied bytes."""
+    """Correlate fresh completion, including Lambda's completion revision change.
+
+    Lambda can assign a second revision when an InProgress update settles. In
+    that case require the accepted operation's exact target, LastModified and
+    code hash. The study's serialized single-writer boundary remains required.
+    """
     revision=accepted.get('RevisionId')
     if not revision or revision==previous_revision:
         raise ValueError('Accepted response has no fresh revision')
     if snapshot.get('LastUpdateStatus')=='Failed':raise ValueError('Update failed asynchronously')
     if snapshot.get('RevisionId')!=revision:
-        if snapshot.get('RevisionId')!=previous_revision:raise ValueError('Concurrent target revision change')
-        return False
+        if snapshot.get('RevisionId')==previous_revision:return False
+        correlated=(snapshot.get('RevisionId') and accepted.get('LastUpdateStatus')=='InProgress'
+                    and accepted.get('FunctionArn') and snapshot.get('FunctionArn')==accepted['FunctionArn']
+                    and accepted.get('LastModified') and snapshot.get('LastModified')==accepted['LastModified']
+                    and accepted.get('CodeSha256')==hash_base64(expected_digest))
+        if not correlated:raise ValueError('Uncorrelated target revision change')
     if snapshot.get('State')!='Active' or snapshot.get('LastUpdateStatus')!='Successful':return False
     if snapshot.get('CodeSha256')!=hash_base64(expected_digest):raise ValueError('Deployment hash mismatch')
     return True

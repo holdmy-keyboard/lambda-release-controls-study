@@ -19,6 +19,9 @@ def collect_ready(receipt,observed,expected):
     if receipt.get('outcome') in ('allow','allow_with_warning'):
         if not receipt.get('deployment_attempted') or not receipt.get('accepted_update'):raise ValueError('Allow receipt lacks accepted update')
         if not ready(observed,receipt['accepted_update'],receipt['pre_target']['RevisionId'],receipt['final_sha256']):return False
+        settled=receipt.get('post_target',{})
+        if not settled.get('RevisionId') or observed.get('RevisionId')!=settled['RevisionId']:
+            raise ValueError('Observer revision differs from the runner completion receipt')
     return receipt.get('outcome') in ('allow','allow_with_warning','block','operational_error')
 
 
@@ -221,7 +224,13 @@ class Controller:
         units=dict(PATH_RESERVATION);units[phase+'_paths']=1
         if inputs['workload']!='timing' or arm not in ('C2','C3'):units['signing_jobs']=0
         ledger.reserve(identifier,phase,units,'0.006')
-        reset=self.reset(arm);dump(self.d/'reset.json',reset,True)
+        try:
+            reset=self.reset(arm);dump(self.d/'reset.json',reset,True)
+        except (OSError,ValueError,KeyError,StageError,subprocess.SubprocessError) as error:
+            self.hold('Sentinel reset needs reconciliation before dispatch: '+str(error))
+            dump(self.d/'pre-dispatch-reset-failure.json',{'attempt_id':identifier,'error':str(error),
+                 'workflow_dispatched':False,'reservation_refunded':False},True)
+            raise
         # One exact ticket at a time. The S3 conditional claim prevents UUID reuse
         # by another workflow run, including a manual duplicate dispatch.
         config=dict(self.c);config['authorized_attempts']={identifier:{'phase':phase,'inputs':inputs,'run_id':None}}
