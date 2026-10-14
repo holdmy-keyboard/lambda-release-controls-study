@@ -13,9 +13,10 @@ https://github.com/sigstore/sigstore-go/blob/v1.3.0/pkg/fulcio/certificate/exten
 
 Pinned gh emits a JSON array of successfully verified records. Its certificate
 extensions are FLAT inside verificationResult.signature.certificate. Its opaque
-Sigstore rejection loses the underlying error; it is conservatively an unknown
-operational error, not credited as a security detection. Live pilot confirmation
-of the pinned executable and actual generated bundles remains required.
+Sigstore rejection loses the underlying error. A separate reject-only diagnostic
+may establish a conclusive authenticated policy mismatch. It can never authorize
+deployment; only the original native exact-identity path can do that. An opaque
+failure without that additional proof remains an unknown operational error.
 """
 from __future__ import annotations
 
@@ -35,6 +36,10 @@ import uuid
 GH_VERSION = "2.101.0"
 ISSUER = "https://token.actions.githubusercontent.com"
 PREDICATE = "https://slsa.dev/provenance/v1"
+# Authentication envelope for rejection diagnostics only. This is NOT an
+# allowed release identity, and a diagnostic success can NEVER return allow.
+DIAGNOSTIC_IDENTITY = (r"^https://github[.]com/[^/]+/[^/]+/[.]github/workflows/"
+                       r"[^/@]+[.]ya?ml@refs/(heads|tags)/.+$")
 EXIT_CODES = {"allow": 0, "block": 10, "operational_error": 20}
 TUPLE_FIELDS = {
     "source_repository", "certificate_identity", "signer_digest",
@@ -357,6 +362,41 @@ def verify_artifact(artifact: Path, bundle: Path | None, policy: dict,
                     outcome, reason = "operational_error", "unexpected_configuration"
             else:
                 outcome, reason = _classify_failure(stderr, row)
+                if outcome == "operational_error" and reason == "unknown":
+                    # Native exact SAN verification intentionally remains the
+                    # sole accepting path. gh's opaque Sigstore error cannot
+                    # establish a block, so authenticate inside the policy's
+                    # fixed GitHub owner and ordinary-workflow SAN envelope.
+                    # The native repository/commit/ref checks also suppress
+                    # structured output on failure. Compare those authenticated
+                    # fields together in _verified_rows instead, for rejection
+                    # only; their original exact native checks remain unchanged.
+                    # Only a conclusive mismatch may refine unknown -> block.
+                    diagnostic = ["gh", "attestation", "verify", str(artifact), "--bundle", str(bundle),
+                                  "--hostname", "github.com", "--owner", row["source_repository"].split("/")[0],
+                                  "--cert-identity-regex", DIAGNOSTIC_IDENTITY,
+                                  "--cert-oidc-issuer", policy["oidc_issuer"],
+                                  "--predicate-type", row["predicate_type"],
+                                  "--deny-self-hosted-runners", "--format=json"]
+                    dcode, dout, derr = run(diagnostic)
+                    detail = {"purpose": "reject_only_authenticated_diagnostic",
+                              "command_index": len(evidence["commands"]) - 1,
+                              "native_exact_outcome": outcome, "native_exact_reason": reason,
+                              "can_authorize": False}
+                    if dcode == 0:
+                        try:
+                            diagnosed, diagnostic_reason, records = _verified_rows(dout, row, digest, policy["oidc_issuer"])
+                            detail["verified_records"] = records
+                        except (ValueError, TypeError, KeyError):
+                            diagnosed, diagnostic_reason = "operational_error", "unexpected_configuration"
+                    else:
+                        diagnosed, diagnostic_reason = _classify_failure(derr, row)
+                    detail.update(outcome=diagnosed, reason=diagnostic_reason)
+                    attempt["rejection_diagnostic"] = detail
+                    if diagnosed == "block":
+                        outcome, reason = diagnosed, diagnostic_reason
+                    # A diagnostic match is not permission to recover from a
+                    # failed exact native check. Leave that case unresolved.
             attempt.update(outcome=outcome, reason=reason)
             evidence["tuple_attempts"].append(attempt)
             if outcome == "allow":

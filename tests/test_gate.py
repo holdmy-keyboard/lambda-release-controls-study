@@ -71,6 +71,60 @@ class GateTests(unittest.TestCase):
         def run(args,**kw):
             return self.runner(args,**kw) if args[1]=='--version' else subprocess.CompletedProcess(args,1,'','Error: verifying with issuer "sigstore.dev"')
         self.assertEqual(self.run_gate(runner=run)['outcome'],'operational_error')
+    def diagnostic_runner(self, diagnostic_response):
+        def run(args,**kw):
+            self.calls.append(args)
+            if args[1]=='--version':return subprocess.CompletedProcess(args,0,'gh version 2.101.0 (unit test)','')
+            if '--cert-identity' in args:return subprocess.CompletedProcess(args,1,'','Error: verifying with issuer "sigstore.dev"')
+            self.assertIn('--cert-identity-regex',args)
+            return diagnostic_response(args)
+        return run
+    def test_diagnostic_can_establish_authenticated_workflow_mismatch(self):
+        row=copy.deepcopy(self.policy['allowed_tuples'][0]);row['certificate_identity']=row['certificate_identity'].replace('release.yml','alternate.yml')
+        runner=self.diagnostic_runner(lambda args:subprocess.CompletedProcess(args,0,json.dumps(verified(row,self.digest)),''))
+        result=self.run_gate(runner=runner)
+        self.assertEqual((result['outcome'],result['reason']),('block','workflow_identity_not_allowed'))
+        self.assertFalse(result['evidence']['tuple_attempts'][0]['rejection_diagnostic']['can_authorize'])
+    def test_diagnostic_match_can_never_authorize(self):
+        runner=self.diagnostic_runner(lambda args:subprocess.CompletedProcess(args,0,json.dumps(verified(self.policy['allowed_tuples'][0],self.digest)),''))
+        result=self.run_gate(runner=runner)
+        self.assertEqual(result['outcome'],'operational_error');self.assertTrue(result['fail_closed'])
+        self.assertNotIn('matched_tuple_index',result['evidence'])
+    def test_diagnostic_authentication_envelope_is_fixed_and_bounded(self):
+        runner=self.diagnostic_runner(lambda args:subprocess.CompletedProcess(args,1,'','unknown failure'))
+        self.run_gate(runner=runner)
+        exact,diagnostic=self.calls[-2:]
+        q=diagnostic.index('--cert-identity-regex')
+        self.assertEqual(diagnostic[diagnostic.index('--owner')+1],'unit-owner')
+        for flag in ('--cert-oidc-issuer','--predicate-type','--hostname','--bundle'):
+            self.assertEqual(exact[exact.index(flag)+1],diagnostic[diagnostic.index(flag)+1])
+        self.assertIn('--deny-self-hosted-runners',diagnostic)
+        self.assertEqual(exact[3],diagnostic[3])
+        for flag in ('--repo','--cert-identity','--signer-digest','--source-digest','--source-ref'):
+            self.assertIn(flag,exact)
+        self.assertTrue(diagnostic[q+1].startswith('^'));self.assertTrue(diagnostic[q+1].endswith('$'))
+    def test_diagnostic_post_crypto_repository_rejection_is_conclusive(self):
+        error='✗ Policy verification failed\nError: expected SourceRepositoryURI to be https://github.com/unit-owner/unit-repo, got https://github.com/unit-owner/other'
+        runner=self.diagnostic_runner(lambda args:subprocess.CompletedProcess(args,1,'',error))
+        result=self.run_gate(runner=runner)
+        self.assertEqual((result['outcome'],result['reason']),('block','repository_not_allowed'))
+    def test_diagnostic_missing_authentication_field_remains_unresolved(self):
+        data=verified(self.policy['allowed_tuples'][0],self.digest)
+        del data[0]['verificationResult']['signature']['certificate']['issuer']
+        runner=self.diagnostic_runner(lambda args:subprocess.CompletedProcess(args,0,json.dumps(data),''))
+        self.assertEqual(self.run_gate(runner=runner)['outcome'],'operational_error')
+    def test_diagnostic_mutation_cannot_be_credited_as_block(self):
+        def changed(args):
+            self.artifact.write_bytes(b'changed after native failure')
+            row=copy.deepcopy(self.policy['allowed_tuples'][0]);row['certificate_identity']=row['certificate_identity'].replace('release.yml','alternate.yml')
+            return subprocess.CompletedProcess(args,0,json.dumps(verified(row,self.digest)),'')
+        result=self.run_gate(runner=self.diagnostic_runner(changed))
+        self.assertEqual(result['outcome'],'operational_error')
+        self.assertIn('input_instability',result['evidence'])
+    def test_diagnostic_without_policy_phase_marker_is_not_block(self):
+        error='Error: expected SourceRepositoryURI to be https://github.com/unit-owner/unit-repo, got bad'
+        runner=self.diagnostic_runner(lambda args:subprocess.CompletedProcess(args,1,'',error))
+        self.assertEqual(self.run_gate(runner=runner)['outcome'],'operational_error')
     def test_input_mutation_supersedes_allow(self):
         def run(args,**kw):
             out=self.runner(args,**kw)
